@@ -48,83 +48,105 @@ public enum MicFormat {
 
 /// Builders for the events this app sends.
 public enum SatelliteMessages {
-    /// Reply to `describe`. HA only needs `satellite` with `installed: true`
-    /// to treat the device as a satellite. `wake` lists the wake words the
-    /// device can detect itself (none yet: Home Assistant detects them).
+    /// Reply to `describe` (WyomingInfoBuilder.kt). `wakeWords` are the
+    /// on-device wake words, grouped by engine ("microwakeword").
     public static func info(
         name: String,
         appVersion: String,
-        area: String? = nil,
-        wakeWords: [(name: String, phrase: String)] = []
+        area: String = "",
+        activeWakeWord: String,
+        wakeWords: [(engine: String, id: String, phrase: String)]
     ) -> WyomingEvent {
-        let attribution: [String: Any] = [
-            "name": "VACA for iOS",
-            "url": "https://github.com/msp1974/ViewAssistCompanionApp",
-        ]
-        var satellite: [String: Any] = [
-            "name": name,
-            "attribution": attribution,
-            "installed": true,
-            "description": "View Assist Companion App for iOS",
-            "version": appVersion,
-            "has_vad": false,
-            "supports_trigger": false,
-        ]
-        if let area { satellite["area"] = area }
-
-        var wake: [[String: Any]] = []
-        if !wakeWords.isEmpty {
-            wake.append([
-                "name": "available_wake_words",
-                "attribution": attribution,
+        let empty: [String: Any] = ["name": "", "url": ""]
+        let models: [[String: Any]] = wakeWords.map { w in
+            [
+                "name": w.id,
+                "attribution": ["name": w.engine.lowercased(), "url": ""],
                 "installed": true,
-                "description": "On-device wake words",
+                "description": w.phrase,
                 "version": appVersion,
-                "models": wakeWords.map { w -> [String: Any] in
-                    [
-                        "name": w.name,
-                        "attribution": ["name": "", "url": ""],
-                        "installed": true,
-                        "description": w.phrase,
-                        "version": appVersion,
-                        "languages": ["en"],
-                        "phrase": w.phrase,
-                    ]
-                },
-            ])
+                "languages": ["en"],
+                "phrase": w.phrase,
+            ]
         }
-
+        let wake: [String: Any] = [
+            "name": "available_wake_words",
+            "attribution": empty,
+            "installed": true,
+            "description": "On-device wake words",
+            "version": appVersion,
+            "models": models,
+        ]
+        let satellite: [String: Any] = [
+            "name": name,
+            "attribution": empty,
+            "installed": true,
+            "description": "View Assist Companion App",
+            "version": appVersion,
+            "area": area,
+            "has_vad": false,
+            "snd_format": ["channels": 1, "rate": 16_000, "width": 2],
+            "active_wake_words": [activeWakeWord],
+            "max_active_wake_words": 1,
+        ]
         return WyomingEvent(type: EventType.info, data: [
-            "asr": [Any](), "tts": [Any](), "handle": [Any](), "intent": [Any](), "snd": [Any](), "mic": [Any](),
-            "wake": wake,
+            "version": appVersion,
+            "asr": [Any](), "tts": [Any](), "handle": [Any](), "intent": [Any](), "stt": [Any](),
+            "wake": [wake],
             "satellite": satellite,
         ])
     }
 
-    /// Reply to `capabilities`. Only keys the integration reads are sent, and
-    /// features iOS can't offer (camera stream, light sensor, DND) are left
-    /// out so HA doesn't create entities for them.
+    /// Reply to `capabilities` (DeviceInfo.getJson + WyomingCapabilitiesBuilder).
+    /// Features iOS can't offer (camera stream, light sensor, DND) are off so
+    /// HA doesn't create entities for them.
     public static func capabilities(
         appVersion: String,
         osVersion: String,
         model: String,
-        hasBattery: Bool
+        hasBattery: Bool,
+        wakeSounds: [(id: String, name: String)],
+        alarms: [(id: String, name: String)]
     ) -> WyomingEvent {
         WyomingEvent(type: EventType.capabilities, data: [
+            "device_signature": model,
             "app_version": appVersion,
             "release": osVersion,
-            "device_signature": model,
             "has_battery": hasBattery,
             "has_front_camera": false,
-            "has_dnd": false,
             "has_rtsp": false,
-            "sensors": [Any](),
+            "has_dnd": false,
+            "proximity_sensor_type": "none",
             "audio": [
                 "max_music_volume": 10,
                 "max_notification_volume": 10,
                 "max_alarm_volume": 10,
+                "has_agc": false,
+                "has_ns": false,
+                "has_aec": true,
+                "inputs": [Any](),
+                "outputs": [Any](),
             ],
+            "sensors": [Any](),
+            "wake_sounds": wakeSounds.map { ["id": $0.id, "name": $0.name] },
+            "alarms": alarms.map { ["id": $0.id, "name": $0.name] },
         ])
+    }
+
+    /// A setting changed on the device, for Home Assistant (Satellite.sendSetting).
+    public static func setting(_ name: String, _ value: Any) -> WyomingEvent {
+        custom(CustomEventType.settings, ["timestamp": isoNow(), "settings": [name: value]])
+    }
+
+    /// `audio-stop` as the Android pipeline sends it, to end listening.
+    public static func pipelineAudioStop() -> WyomingEvent {
+        WyomingEvent(type: EventType.audioStop, data: ["timestamp": isoNow()])
+    }
+
+    public static func isoNow() -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: Date())
     }
 
     /// Ask HA to run a pipeline. `start` is "wake" (HA listens for the wake
@@ -175,7 +197,11 @@ public enum SatelliteMessages {
     }
 
     /// An empty settings event asks HA to send all settings again.
-    public static func requestSettings() -> WyomingEvent { custom(CustomEventType.settings, [:]) }
+    public static func requestSettings() -> WyomingEvent {
+        WyomingEvent(type: EventType.customEvent, data: ["event_type": CustomEventType.settings])
+    }
+
+    public static func ping() -> WyomingEvent { WyomingEvent(type: EventType.ping, data: ["text": ""]) }
 }
 
 /// A VACA custom event received from HA. HA flattens the body into `data`

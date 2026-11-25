@@ -16,8 +16,8 @@ struct SetupView: View {
                          "In Home Assistant, install View Assist Companion App from HACS and restart.")
                     step(2, "Add this iPad",
                          "Keep this app open. Home Assistant finds it on your network: Settings → Devices & services → Discovered → VACA. Allow Local Network access here if asked.")
-                    step(3, "Set up the wake word",
-                         "On iOS, Home Assistant listens for the wake word. Add the openWakeWord add-on (or another wake word service) and pick a wake word in your voice assistant's settings. The microphone button always works too.")
+                    step(3, "Choose a wake word",
+                         "The iPad listens for the wake word itself, as the Android app does. Pick one on the device's page in Home Assistant (Wake word): Hey Jarvis, Okay Nabu, Alexa, Hey Mycroft, Hey Luna or Hey Home Assistant. The microphone button always works too.")
                     step(4, "Keep it on screen",
                          "Plug the iPad in. To lock it to this app, turn on Guided Access (iPad Settings → Accessibility → Guided Access), then triple-click the top or Home button here.")
 

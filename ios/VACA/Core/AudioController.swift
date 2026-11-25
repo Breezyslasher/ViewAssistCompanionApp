@@ -2,36 +2,36 @@ import AVFoundation
 import Foundation
 import VACACore
 
-/// Microphone capture and voice-response playback, on one AVAudioEngine.
+/// Microphone capture and voice-response playback on one AVAudioEngine
+/// (the Android app's MicrophoneInput + voice player).
 ///
-/// The microphone runs all the time while Home Assistant is connected: HA
-/// listens for the wake word in the stream. With the `audio` background
-/// mode this keeps working while the screen is locked.
+/// The microphone runs all the time for on-device wake word detection. With
+/// the `audio` background mode this keeps working while the screen is locked.
 final class AudioController {
     private let engine = AVAudioEngine()
-    private let ttsPlayer = AVAudioPlayerNode()
-    private let chimePlayer = AVAudioPlayerNode()
-    private var ttsFormat: AVAudioFormat?
+    private let voicePlayer = AVAudioPlayerNode()
+    private var voiceFormat: AVAudioFormat?
     private var resampler: MicResampler?
-    private var configured = false
+    private var attached = false
 
-    /// Called on the main queue with 16 kHz mono 16-bit PCM.
+    /// Microphone audio, 16 kHz mono 16-bit PCM, about every 64 ms. Called on
+    /// `micQueue`, not the main queue, so wake word detection stays off it.
     var onMicAudio: ((Data) -> Void)?
-    /// Called on the main queue when a response finishes playing.
-    var onResponsePlayed: (() -> Void)?
+    let micQueue = DispatchQueue(label: "vaca.mic", qos: .userInteractive)
 
     private var scheduledBuffers = 0
-    /// Bumped per response, so completions from a stopped one are ignored.
     private var responseGeneration = 0
-    private var responseEnded = false
-    private var responseActive = false
+    private var drainCompletion: (() -> Void)?
+    private var drainDeadline: DispatchWorkItem?
+    private(set) var isResponding = false
 
-    var micGainDb: Float = 0 { didSet { resampler?.gain = Self.gain(micGainDb) } }
-    var responseVolume: Float = 1 { didSet { ttsPlayer.volume = responseVolume } }
-    var echoCancellation = false
+    var micGainDb: Float = 0 {
+        didSet { let g = Self.gain(micGainDb); micQueue.async { self.resampler?.gain = g } }
+    }
+    var voiceVolume: Float = 1 { didSet { voicePlayer.volume = voiceVolume } }
+    var echoCancellation = true
 
     private(set) var isRunning = false
-
     private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -41,7 +41,11 @@ final class AudioController {
         ) { [weak self] note in self?.handleInterruption(note) })
         observers.append(center.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in self?.handleConfigurationChange() })
+        ) { [weak self] _ in
+            Log.shared.add("Audio route changed; restarting")
+            self?.voiceFormat = nil
+            self?.restart()
+        })
     }
 
     static func requestPermission(_ done: @escaping (Bool) -> Void) {
@@ -56,16 +60,18 @@ final class AudioController {
         guard !isRunning else { return }
         do {
             let session = AVAudioSession.sharedInstance()
+            // Other audio (including our own media player) keeps playing.
             try session.setCategory(.playAndRecord, mode: .default,
-                                    options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                                    options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
             try session.setPreferredSampleRate(48_000)
             try session.setActive(true)
 
-            if !configured {
-                engine.attach(ttsPlayer)
-                engine.attach(chimePlayer)
-                configured = true
+            if !attached {
+                engine.attach(voicePlayer)
+                attached = true
             }
+            // Echo cancellation keeps the device's own voice and sounds out of
+            // the wake word detector, like the Android app's AEC.
             try? engine.inputNode.setVoiceProcessingEnabled(echoCancellation)
 
             let input = engine.inputNode
@@ -76,25 +82,24 @@ final class AudioController {
             }
             let resampler = MicResampler(inputRate: inputFormat.sampleRate)
             resampler.gain = Self.gain(micGainDb)
-            self.resampler = resampler
+            micQueue.sync { self.resampler = resampler }
 
             input.removeTap(onBus: 0)
-            // About 85 ms per buffer at 48 kHz.
-            input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-                guard let channel = buffer.floatChannelData?[0] else { return }
-                let pcm = resampler.process(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
-                guard !pcm.isEmpty else { return }
-                DispatchQueue.main.async { self?.onMicAudio?(pcm) }
+            input.installTap(onBus: 0, bufferSize: 3072, format: inputFormat) { [weak self] buffer, _ in
+                guard let self, let channel = buffer.floatChannelData?[0] else { return }
+                let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+                self.micQueue.async {
+                    guard let resampler = self.resampler else { return }
+                    let pcm = samples.withUnsafeBufferPointer { resampler.process($0) }
+                    if !pcm.isEmpty { self.onMicAudio?(pcm) }
+                }
             }
 
-            connectTTS(rate: 22_050)
-            let chimeFormat = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
-            engine.connect(chimePlayer, to: engine.mainMixerNode, format: chimeFormat)
-
+            connectVoice(rate: 22_050)
             engine.prepare()
             try engine.start()
             isRunning = true
-            Log.shared.add("Audio started (mic \(Int(inputFormat.sampleRate)) Hz)")
+            Log.shared.add("Audio started (mic \(Int(inputFormat.sampleRate)) Hz, echo cancellation \(echoCancellation ? "on" : "off"))")
         } catch {
             Log.shared.add("Audio start failed: \(error.localizedDescription)")
         }
@@ -103,51 +108,43 @@ final class AudioController {
     func stop() {
         guard isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
-        ttsPlayer.stop()
-        chimePlayer.stop()
+        stopResponse()
         engine.stop()
         isRunning = false
-        resampler = nil
     }
 
     func restart() {
         stop()
+        isRunning = false
         start()
     }
 
     private static func gain(_ db: Float) -> Float { powf(10, db / 20) }
 
-    // MARK: Response playback
+    // MARK: Voice response
 
-    private func connectTTS(rate: Double) {
+    private func connectVoice(rate: Double) {
+        if voiceFormat?.sampleRate == rate { return }
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false) else { return }
-        if ttsFormat?.sampleRate == rate { return }
-        engine.disconnectNodeOutput(ttsPlayer)
-        engine.connect(ttsPlayer, to: engine.mainMixerNode, format: format)
-        ttsFormat = format
+        engine.disconnectNodeOutput(voicePlayer)
+        engine.connect(voicePlayer, to: engine.mainMixerNode, format: format)
+        voiceFormat = format
     }
 
-    /// `audio-start` from Home Assistant.
+    /// `audio-start`: get ready for a response.
     func beginResponse(rate: Int, channels: Int) {
         if !isRunning { start() }
-        ttsPlayer.stop()
-        responseGeneration += 1
-        scheduledBuffers = 0
-        responseEnded = false
-        responseActive = true
-        if channels != 1 { Log.shared.add("Response has \(channels) channels; playing the first") }
-        connectTTS(rate: Double(rate))
-        ttsPlayer.volume = responseVolume
-        ttsPlayer.play()
+        stopResponse()
+        isResponding = true
+        connectVoice(rate: Double(rate))
+        voicePlayer.volume = voiceVolume
+        voicePlayer.play()
     }
 
-    /// `audio-chunk` from Home Assistant: 16-bit PCM.
-    func appendResponse(_ pcm: Data, channels: Int) {
-        guard responseActive, let format = ttsFormat else { return }
-        var samples = PCM.int16ToFloat(pcm)
-        if channels > 1 {
-            samples = stride(from: 0, to: samples.count, by: channels).map { samples[$0] }
-        }
+    /// `audio-chunk`: 16-bit PCM.
+    func appendResponse(_ pcm: Data) {
+        guard isResponding, let format = voiceFormat else { return }
+        let samples = PCM.int16ToFloat(pcm)
         guard !samples.isEmpty,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
               let channel = buffer.floatChannelData?[0] else { return }
@@ -156,62 +153,48 @@ final class AudioController {
 
         scheduledBuffers += 1
         let generation = responseGeneration
-        ttsPlayer.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+        voicePlayer.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self, generation == self.responseGeneration else { return }
                 self.scheduledBuffers = max(0, self.scheduledBuffers - 1)
-                self.finishIfDone()
+                self.finishDrainIfDone()
             }
         }
-        if !ttsPlayer.isPlaying { ttsPlayer.play() }
+        if !voicePlayer.isPlaying { voicePlayer.play() }
     }
 
-    /// `audio-stop` from Home Assistant: no more audio is coming.
-    func endResponse() {
-        guard responseActive else { return }
-        responseEnded = true
-        finishIfDone()
+    /// `audio-stop`: call `done` once everything queued has played.
+    func drainResponse(_ done: @escaping () -> Void) {
+        guard isResponding else { done(); return }
+        drainCompletion = done
+        // Safety net in case a completion callback never arrives.
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self, self.drainCompletion != nil else { return }
+            Log.shared.add("Response playback did not report finishing; continuing")
+            self.stopResponse()
+        }
+        drainDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: deadline)
+        finishDrainIfDone()
     }
 
-    /// Stop speaking now (interrupt). Reports the response as played.
-    func cancelResponse() {
-        guard responseActive else { return }
+    /// Stop speaking now. Runs any pending drain completion.
+    func stopResponse() {
         responseGeneration += 1
-        ttsPlayer.stop()
+        voicePlayer.stop()
         scheduledBuffers = 0
-        responseEnded = true
-        finishIfDone()
-    }
-
-    private func finishIfDone() {
-        guard responseActive, responseEnded, scheduledBuffers == 0 else { return }
-        responseActive = false
-        onResponsePlayed?()
-    }
-
-    // MARK: Chime
-
-    /// A short two-note chime when the wake word is heard.
-    func playWakeChime() {
-        guard isRunning, let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1) else { return }
-        let rate = 44_100.0
-        let notes: [(Double, Double)] = [(880, 0.07), (1320, 0.09)]
-        let total = notes.reduce(0) { $0 + Int($1.1 * rate) }
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(total)),
-              let out = buffer.floatChannelData?[0] else { return }
-        var i = 0
-        for (frequency, duration) in notes {
-            let n = Int(duration * rate)
-            for k in 0..<n {
-                let fade = min(1, Double(min(k, n - k)) / (0.01 * rate))
-                out[i] = Float(sin(2 * .pi * frequency * Double(k) / rate) * 0.3 * fade)
-                i += 1
-            }
+        isResponding = false
+        drainDeadline?.cancel()
+        drainDeadline = nil
+        if let done = drainCompletion {
+            drainCompletion = nil
+            done()
         }
-        buffer.frameLength = AVAudioFrameCount(total)
-        chimePlayer.volume = responseVolume
-        chimePlayer.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
-        chimePlayer.play()
+    }
+
+    private func finishDrainIfDone() {
+        guard drainCompletion != nil, scheduledBuffers == 0 else { return }
+        stopResponse()
     }
 
     // MARK: Interruptions
@@ -229,12 +212,5 @@ final class AudioController {
         @unknown default:
             break
         }
-    }
-
-    private func handleConfigurationChange() {
-        // Route changed (headphones, Bluetooth); the input format may differ.
-        Log.shared.add("Audio route changed; restarting")
-        ttsFormat = nil
-        restart()
     }
 }

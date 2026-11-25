@@ -9,6 +9,8 @@ final class WyomingConnection {
     private let connection: NWConnection
     private let parser = WyomingParser()
     private var closed = false
+    private var lastMessage = Date()
+    private var keepAlive: Timer?
 
     var onEvent: ((WyomingConnection, WyomingEvent) -> Void)?
     var onClose: ((WyomingConnection) -> Void)?
@@ -51,6 +53,7 @@ final class WyomingConnection {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty {
+                self.lastMessage = Date()
                 do {
                     for event in try self.parser.append(data) {
                         self.onEvent?(self, event)
@@ -74,9 +77,28 @@ final class WyomingConnection {
         connection.send(content: event.encoded(), completion: .contentProcessed { _ in })
     }
 
+    /// For the satellite connection, as the Android app does: ping every
+    /// 3 s, and drop the connection after 5 s without hearing anything.
+    func startKeepAlive() {
+        guard keepAlive == nil else { return }
+        lastMessage = Date()
+        var ticks = 0
+        keepAlive = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            ticks += 1
+            if ticks % 3 == 0 { self.send(SatelliteMessages.ping()) }
+            if Date().timeIntervalSince(self.lastMessage) > 5 {
+                Log.shared.add("No reply from Home Assistant for 5 s; closing connection")
+                self.close()
+            }
+        }
+    }
+
     func close() {
         guard !closed else { return }
         closed = true
+        keepAlive?.invalidate()
+        keepAlive = nil
         connection.cancel()
         onClose?(self)
     }

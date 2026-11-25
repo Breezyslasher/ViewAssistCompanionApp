@@ -1,0 +1,16 @@
+# TensorFlow Lite runs the microWakeWord models (the Android app uses LiteRT).
+platform :ios, '15.0'
+project 'VACA.xcodeproj'
+
+target 'VACA' do
+  use_frameworks! :linkage => :static
+  pod 'TensorFlowLiteSwift', '~> 2.14'
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+  end
+end

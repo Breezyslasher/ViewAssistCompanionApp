@@ -92,3 +92,6 @@ ios/ipa/
 ios/*.ipa
 ios/VACACore/.build/
 ios/VACACore/.swiftpm/
+ios/Pods/
+ios/Podfile.lock
+ios/*.xcworkspace/

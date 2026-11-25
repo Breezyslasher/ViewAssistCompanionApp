@@ -75,15 +75,30 @@ final class WyomingParserTests: XCTestCase {
 
     func testInfoMarksSatelliteInstalled() throws {
         let parsed = try XCTUnwrap(try WyomingParser().append(
-            SatelliteMessages.info(name: "Kitchen iPad", appVersion: "0.1.0").encoded()
+            SatelliteMessages.info(
+                name: "Kitchen iPad", appVersion: "0.1.0", activeWakeWord: "hey_jarvis",
+                wakeWords: [("microwakeword", "hey_jarvis", "Hey Jarvis")]
+            ).encoded()
         ).first)
         let satellite = try XCTUnwrap(parsed.dict("satellite"))
         XCTAssertEqual(satellite["installed"] as? Bool, true)
         XCTAssertEqual(satellite["name"] as? String, "Kitchen iPad")
+        XCTAssertEqual(satellite["active_wake_words"] as? [String], ["hey_jarvis"])
         // Fields the Python dataclasses require
         for key in ["attribution", "description", "version"] {
             XCTAssertNotNil(satellite[key], key)
         }
+        let wake = try XCTUnwrap((parsed.data["wake"] as? [[String: Any]])?.first)
+        XCTAssertEqual(wake["name"] as? String, "available_wake_words")
+        let model = try XCTUnwrap((wake["models"] as? [[String: Any]])?.first)
+        XCTAssertEqual(model["name"] as? String, "hey_jarvis")
+        XCTAssertEqual((model["attribution"] as? [String: Any])?["name"] as? String, "microwakeword")
+    }
+
+    func testSettingRequestHasNoData() throws {
+        let parsed = try XCTUnwrap(try WyomingParser().append(SatelliteMessages.requestSettings().encoded()).first)
+        XCTAssertEqual(parsed.string("event_type"), "settings")
+        XCTAssertNil(parsed.data["data"])
     }
 }
 

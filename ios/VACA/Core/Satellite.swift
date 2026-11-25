@@ -12,12 +12,14 @@ enum WebCommand {
     case load(URL)
 }
 
-/// The device side of the VACA integration: answers Home Assistant's
-/// connection, streams the microphone for wake word detection, plays
-/// responses and media, and applies the settings and actions HA sends.
+/// The device side of VACA: a port of the Android app's Satellite.kt and
+/// WyomingTCPServer.kt. It answers Home Assistant's connection, listens for
+/// the wake word on the device, runs voice interactions (AudioPipeline),
+/// plays responses, sounds, alarms and media, and applies the settings and
+/// actions Home Assistant sends.
 ///
-/// Everything here runs on the main queue (the network and audio callbacks
-/// hop to it), so there is no locking.
+/// Everything here runs on the main queue except the microphone path, which
+/// hops to it.
 final class Satellite: ObservableObject {
     static let shared = Satellite()
 
@@ -35,29 +37,48 @@ final class Satellite: ObservableObject {
     @Published private(set) var darkMode: Bool?
     @Published private(set) var pageZoom: CGFloat = 1
     @Published private(set) var micAllowed: Bool?
+    @Published private(set) var wakeWordPhrase = ""
 
     let webCommands = PassthroughSubject<WebCommand, Never>()
 
-    // MARK: Internals
+    // MARK: Parts
 
     private let settings = AppSettings.shared
     private let server = WyomingServer()
     private let audio = AudioController()
     private let media = MediaController()
+    private let sounds = SoundEffects()
+    private let wake = WakeWordEngine()
 
     private var satelliteConnection: WyomingConnection?
-    /// Address Home Assistant connected from, to find its web UI if needed.
     private var haHost: String?
     /// Settings Home Assistant sent (custom_settings in the integration).
     private var haSettings: [String: Any] = [:]
+    private var settingsReceived = false
 
-    private var streaming = false
+    // MARK: Voice
+
+    private var pipeline: AudioPipeline?
+    private var pipelineCount = 0
+    private var pipelineWatchdog: Timer?
+    /// Microphone audio kept from the wake word until Home Assistant starts
+    /// listening, so nothing said straight after the wake word is lost.
+    private var preRoll: [Data]?
+    private var micStreaming = false
     private var micTimestamp = 0
-    private var pipelineRunning = false
-    private var manualRunPending = false
-    private var muted = false
 
-    private var wakeSoundEnabled = true
+    private var wakeWord = "hey_jarvis"
+    private var wakeThreshold: Float = -1
+    private var wakeWordSound = "none"
+    private var alarmSound = "default"
+    private var continueConversation = false
+    private var screenOnWakeWord = true
+    private var muted = false
+    /// Read on the microphone queue.
+    private var stopWordArmed = false
+
+    // MARK: Screen
+
     private var screenAlwaysOn = true
     private var screenTimeout: TimeInterval = 60
     private var brightness: CGFloat = UIScreen.main.brightness
@@ -67,6 +88,7 @@ final class Satellite: ObservableObject {
     private var statusTimer: Timer?
     private var toastTimer: Timer?
     private var errorTimer: Timer?
+    private var settingsTimer: Timer?
     private var cancellables = Set<AnyCancellable>()
 
     private init() {}
@@ -78,9 +100,13 @@ final class Satellite: ObservableObject {
         UIDevice.current.isBatteryMonitoringEnabled = true
 
         audio.echoCancellation = settings.echoCancellation
-        audio.onMicAudio = { [weak self] pcm in self?.sendMic(pcm) }
-        audio.onResponsePlayed = { [weak self] in self?.responsePlayed() }
+        audio.onMicAudio = { [weak self] pcm in self?.micAudio(pcm) }
         media.onStateChange = { [weak self] _ in self?.sendStatus() }
+
+        wake.onWakeWord = { [weak self] detection in self?.wakeWordDetected(detection) }
+        wake.onStopWord = { [weak self] in self?.stopWordDetected() }
+        wake.stopWordActive = { [weak self] in self?.stopWordArmed ?? false }
+        configureWakeWord()
 
         server.onEvent = { [weak self] connection, event in self?.handle(event, from: connection) }
         server.onClose = { [weak self] connection in self?.connectionClosed(connection) }
@@ -94,9 +120,8 @@ final class Satellite: ObservableObject {
             guard let self else { return }
             self.micAllowed = granted
             if granted {
-                // Keep the engine running even while disconnected: with the
-                // audio background mode it is what keeps the app awake
-                // (and reconnectable) when the screen locks.
+                // Always on: wake word detection, and with the audio
+                // background mode it keeps the app running when locked.
                 self.audio.start()
             } else {
                 Log.shared.add("Microphone permission denied")
@@ -120,11 +145,9 @@ final class Satellite: ObservableObject {
         resetIdleTimer()
     }
 
-    /// Restart the server after the name or port changes in Settings.
     func restartServer() {
         satelliteConnection = nil
         connected = false
-        streaming = false
         server.start(port: settings.port, serviceName: settings.serviceName)
     }
 
@@ -134,88 +157,49 @@ final class Satellite: ObservableObject {
         updateDashboardURL()
     }
 
-    // MARK: Events from Home Assistant
+    // MARK: Connection (WyomingTCPServer.messageHandler)
 
     private func handle(_ event: WyomingEvent, from connection: WyomingConnection) {
-        let isSatellite = connection === satelliteConnection
-
         switch event.type {
-        case EventType.describe:
-            connection.send(SatelliteMessages.info(
-                name: settings.deviceName,
-                appVersion: AppSettings.appVersion,
-                area: haSettings["area"] as? String
-            ))
-
-        case EventType.capabilities:
-            connection.send(SatelliteMessages.capabilities(
-                appVersion: AppSettings.appVersion,
-                osVersion: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
-                model: Self.modelIdentifier,
-                hasBattery: UIDevice.current.batteryState != .unknown
-            ))
-
         case EventType.ping:
             connection.send(SatelliteMessages.pong(text: event.string("text")))
-
+        case EventType.pong:
+            break
+        case EventType.describe:
+            connection.send(infoEvent())
+        case EventType.capabilities:
+            connection.send(capabilitiesEvent())
         case EventType.runSatellite:
             becomeSatellite(connection)
-
-        case EventType.pauseSatellite where isSatellite:
+        case EventType.pauseSatellite:
+            // HA sends this on reload/restart, normally followed by
+            // run-satellite; the connection watchdog handles real loss.
             Log.shared.add("Home Assistant paused the satellite")
-            streaming = false
-            pipelineRunning = false
-            setPhase(.idle)
-
-        case EventType.detection where isSatellite:
-            wakeDetected()
-
-        case EventType.transcribe where isSatellite:
-            if phase == .idle { setPhase(.listening) }
-
-        case EventType.voiceStopped where isSatellite:
-            setPhase(.thinking)
-
-        case EventType.transcript where isSatellite:
-            transcript = event.string("text") ?? ""
-            setPhase(.thinking)
-
-        case EventType.synthesize where isSatellite:
-            response = event.string("text") ?? ""
-
-        case EventType.audioStart where isSatellite:
-            setPhase(.speaking)
-            media.setDucked(true)
-            audio.beginResponse(rate: event.int("rate") ?? 22_050, channels: event.int("channels") ?? 1)
-
-        case EventType.audioChunk where isSatellite:
-            if let payload = event.payload {
-                audio.appendResponse(payload, channels: event.int("channels") ?? 1)
-            }
-
-        case EventType.audioStop where isSatellite:
-            audio.endResponse()
-
-        case EventType.error where isSatellite:
-            let text = event.string("text") ?? "Something went wrong"
-            Log.shared.add("Pipeline error: \(text) (\(event.string("code") ?? "-"))")
-            // Wake word stage ending without a wake word is routine.
-            if event.string("code") != "wake-word-timeout" { showError(text) }
-
-        case EventType.pipelineEnded where isSatellite:
-            pipelineEnded()
-
-        case EventType.customEvent:
-            if let custom = IncomingCustomEvent(event) { handleCustom(custom) }
-
-        case EventType.pong, EventType.detect, EventType.voiceStarted, EventType.handled:
-            break
-
         default:
-            if !event.type.hasPrefix("timer-") {
-                Log.shared.add("Unhandled event: \(event.type)")
-            }
+            guard connection === satelliteConnection else { return }
+            processMessage(event)
         }
+    }
+
+    private func infoEvent() -> WyomingEvent {
+        SatelliteMessages.info(
+            name: settings.deviceName,
+            appVersion: AppSettings.appVersion,
+            area: haSettings["area"] as? String ?? "",
+            activeWakeWord: wakeWord,
+            wakeWords: wake.available.map { (WakeWordEngine.engineName, $0.id, $0.manifest.wake_word) }
+        )
+    }
+
+    private func capabilitiesEvent() -> WyomingEvent {
+        SatelliteMessages.capabilities(
+            appVersion: AppSettings.appVersion,
+            osVersion: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+            model: Self.modelIdentifier,
+            hasBattery: UIDevice.current.batteryState != .unknown,
+            wakeSounds: sounds.wakeSounds.map { ($0.id, $0.name) },
+            alarms: sounds.alarms.map { ($0.id, $0.name) }
+        )
     }
 
     private func becomeSatellite(_ connection: WyomingConnection) {
@@ -223,14 +207,20 @@ final class Satellite: ObservableObject {
         satelliteConnection = connection
         haHost = connection.remoteHost
         connected = true
-        streaming = true
-        pipelineRunning = false
-        manualRunPending = false
+        connection.startKeepAlive()
         Log.shared.add("Home Assistant connected from \(haHost ?? "?")")
         if micAllowed == true, !audio.isRunning { audio.start() }
         updateDashboardURL()
-        startWakePipeline()
         sendStatus()
+
+        // HA sends all settings after run-satellite; ask again if they don't
+        // arrive (Satellite.waitForSettings).
+        settingsTimer?.invalidate()
+        settingsTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+            guard let self, !self.settingsReceived else { return }
+            Log.shared.add("No settings from Home Assistant yet; asking")
+            self.satelliteConnection?.send(SatelliteMessages.requestSettings())
+        }
     }
 
     private func connectionClosed(_ connection: WyomingConnection) {
@@ -238,89 +228,148 @@ final class Satellite: ObservableObject {
         Log.shared.add("Home Assistant disconnected")
         satelliteConnection = nil
         connected = false
-        streaming = false
-        pipelineRunning = false
-        manualRunPending = false
-        audio.cancelResponse()
+        pipeline?.stop()
+        pipeline = nil
+        audio.stopResponse()
         setPhase(.idle)
     }
 
-    // MARK: Voice pipeline
+    /// Satellite.processMessage
+    private func processMessage(_ event: WyomingEvent) {
+        if event.type == EventType.customEvent {
+            if let custom = IncomingCustomEvent(event) { handleCustom(custom) }
+            return
+        }
+        if let pipeline, pipeline.isActive {
+            pipeline.handle(event)
+        } else if event.type == EventType.audioStart {
+            // An announcement, or a response without our own pipeline.
+            startPipeline(.startStreamTTS)
+            pipeline?.handle(event)
+        } else if event.type == EventType.transcribe {
+            // Home Assistant started listening (start conversation).
+            startPipeline(.requestedByServer)
+            pipeline?.handle(event)
+        }
+    }
 
-    /// Stream the mic and let Home Assistant listen for the wake word.
-    private func startWakePipeline() {
-        guard streaming, !muted, !pipelineRunning, let connection = satelliteConnection else { return }
-        pipelineRunning = true
-        connection.send(SatelliteMessages.runPipeline(start: "wake"))
+    // MARK: Wake word
+
+    private func configureWakeWord() {
+        let word = wakeWord
+        let threshold = wakeThreshold
+        let muted = self.muted
+        wakeWordPhrase = wake.available.first { $0.id == word }?.manifest.wake_word ?? word
+        audio.micQueue.async {
+            self.wake.muted = muted
+            self.wake.configure(wakeWord: word, threshold: threshold)
+        }
+    }
+
+    /// Microphone audio, on the mic queue.
+    private func micAudio(_ pcm: Data) {
+        wake.process(pcm)
+        DispatchQueue.main.async { self.forwardMic(pcm) }
+    }
+
+    private func forwardMic(_ pcm: Data) {
+        if micStreaming {
+            sendMic(pcm)
+        } else if preRoll != nil {
+            preRoll?.append(pcm)
+            // Keep at most ~5 s.
+            if (preRoll?.count ?? 0) > 80 { preRoll?.removeFirst() }
+        }
     }
 
     private func sendMic(_ pcm: Data) {
-        guard streaming, !muted, let connection = satelliteConnection else { return }
+        guard let connection = satelliteConnection else { return }
         connection.send(SatelliteMessages.micChunk(pcm, timestampMs: micTimestamp))
         micTimestamp += PCM.milliseconds(bytes: pcm.count, rate: MicFormat.rate)
     }
 
-    private func wakeDetected() {
+    /// Satellite.handleWakeWordDetection
+    private func wakeWordDetected(_ detection: WakeWordDetection) {
+        Log.shared.add("Wake word: \(detection.wakeWord) (\(String(format: "%.2f", detection.score)))")
+        guard satelliteConnection != nil else {
+            showToast("No connection to Home Assistant. Unable to respond to voice command.")
+            return
+        }
+        // A wake word while the device is talking interrupts it.
+        if isResponding {
+            interruptResponse()
+            return
+        }
+        startWakePipeline()
+    }
+
+    /// Wake word heard, or a manual wake.
+    private func startWakePipeline() {
         transcript = ""
         response = ""
-        setPhase(.listening)
-        screenWake()
+        if screenOnWakeWord { screenWake() }
         media.setDucked(true)
-        if wakeSoundEnabled { audio.playWakeChime() }
+        sounds.playWakeSound(wakeWordSound)
+        preRoll = []
+        startPipeline(.wakeWordDetected)
     }
 
-    /// Start listening without the wake word: the on-screen button, or the
-    /// Wake button / action in Home Assistant.
+    /// The microphone button, or the Wake button / action in Home Assistant.
     func talkNow() {
         screenWake()
-        guard let connection = satelliteConnection, streaming else { return }
-        wakeDetected()
-        if pipelineRunning {
-            // End the wake word stage first; the listening run starts when
-            // HA reports the pipeline ended (or after a short wait).
-            manualRunPending = true
-            connection.send(SatelliteMessages.audioStop(timestampMs: micTimestamp))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self, self.manualRunPending else { return }
-                self.manualRunPending = false
-                self.startListeningRun()
-            }
-        } else {
-            startListeningRun()
-        }
+        guard satelliteConnection != nil else { return }
+        if isResponding { interruptResponse() }
+        startWakePipeline()
     }
 
-    private func startListeningRun() {
-        guard let connection = satelliteConnection else { return }
-        pipelineRunning = true
-        connection.send(SatelliteMessages.runPipeline(start: "asr"))
+    private var isResponding: Bool {
+        if audio.isResponding { return true }
+        guard let pipeline, pipeline.isActive else { return false }
+        return pipeline.stage >= .startingTTS
     }
 
-    private func pipelineEnded() {
-        pipelineRunning = false
-        if manualRunPending {
-            manualRunPending = false
-            startListeningRun()
-            return
-        }
-        if phase == .speaking {
-            // Restart once the response has finished playing.
-            return
-        }
-        if phase != .idle { setPhase(.idle) }
-        media.setDucked(false)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.startWakePipeline()
-        }
-    }
-
-    private func responsePlayed() {
-        satelliteConnection?.send(SatelliteMessages.played())
+    private func interruptResponse() {
+        Log.shared.add("Interrupted")
+        pipeline?.stop()
+        pipeline = nil
+        audio.stopResponse()
         media.setDucked(false)
         setPhase(.idle)
-        resetIdleTimer()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.startWakePipeline()
+    }
+
+    /// "Stop" while talking or while the alarm sounds (Satellite.handleStopWord).
+    private func stopWordDetected() {
+        Log.shared.add("Stop word")
+        if isResponding { interruptResponse() }
+        if sounds.isAlarmSounding { setAlarm(false) }
+        updateStopWordArmed()
+    }
+
+    private func updateStopWordArmed() {
+        stopWordArmed = isResponding || sounds.isAlarmSounding
+    }
+
+    // MARK: Pipeline
+
+    private func startPipeline(_ mode: PipelineStartMode) {
+        pipeline?.stop()
+        pipelineCount += 1
+        let pipeline = AudioPipeline(
+            id: pipelineCount,
+            startMode: mode,
+            wakeWordName: wakeWord,
+            satelliteName: settings.deviceName,
+            continueConversation: continueConversation,
+            host: self
+        )
+        self.pipeline = pipeline
+        pipeline.start()
+
+        pipelineWatchdog?.invalidate()
+        pipelineWatchdog = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self, weak pipeline] timer in
+            guard let pipeline, pipeline.isActive else { timer.invalidate(); return }
+            pipeline.watchdogTick()
+            if self?.pipeline !== pipeline { timer.invalidate() }
         }
     }
 
@@ -337,103 +386,139 @@ final class Satellite: ObservableObject {
         case CustomEventType.settings:
             let incoming = event.settings
             haSettings.merge(incoming) { _, new in new }
-            for (key, value) in incoming { applySetting(key, value) }
+            processSettings(incoming)
+            settingsReceived = true
         case CustomEventType.action:
             if let action = event.action { handleAction(action, event.payload) }
-        default:
-            Log.shared.add("Unhandled custom event: \(event.eventType)")
-        }
-    }
-
-    private func applySetting(_ key: String, _ value: Any) {
-        switch key {
-        case "ha_url", "ha_port", "ha_dashboard":
-            updateDashboardURL()
-        case "screen_brightness":
-            if let v = Self.number(value) {
-                brightness = CGFloat(max(0, min(100, v)) / 100)
-                if screenOn { UIScreen.main.brightness = brightness }
-            }
-        case "screen_on":
-            if let on = Self.bool(value) { on ? screenWake() : screenSleep() }
-        case "screen_always_on":
-            if let on = Self.bool(value) { screenAlwaysOn = on; resetIdleTimer() }
-        case "screen_timeout":
-            if let v = Self.number(value), v > 0 { screenTimeout = v; resetIdleTimer() }
-        case "dark_mode":
-            darkMode = Self.bool(value)
-        case "zoom_level":
-            // HA sends round(zoom * 100) + 60, or 0 for the default.
-            if let v = Self.number(value) {
-                pageZoom = v > 0 ? CGFloat(max(0.3, min(3, (v - 60) / 100))) : 1
-            }
-        case "music_volume":
-            if let v = Self.number(value) { media.musicVolume = Float(v / 10) }
-        case "notification_volume":
-            if let v = Self.number(value) {
-                audio.responseVolume = Float(v / 10)
-                media.announceVolume = Float(v / 10)
-            }
-        case "ducking_volume":
-            if let v = Self.number(value) { media.duckingVolume = Float(v / 10) }
-        case "mic_gain":
-            if let v = Self.number(value) { audio.micGainDb = Float(v) }
-        case "wake_word_sound":
-            wakeSoundEnabled = (value as? String)?.lowercased() != "none"
-        case "mute":
-            if let on = Self.bool(value) {
-                muted = on
-                if !on { startWakePipeline() }
-            }
+        case CustomEventType.capabilities:
+            satelliteConnection?.send(capabilitiesEvent())
         default:
             break
         }
     }
 
+    /// APPConfig.processSettings, for the settings that apply on iOS.
+    private func processSettings(_ s: [String: Any]) {
+        var wakeChanged = false
+
+        if s["ha_url"] != nil || s["ha_port"] != nil || s["ha_dashboard"] != nil { updateDashboardURL() }
+
+        if let engine = s["wake_word_engine"] as? String, engine != WakeWordEngine.engineName {
+            // iOS runs microWakeWord; switch HA's select so its wake word
+            // list shows the models this device has.
+            sendSetting("wake_word_engine", WakeWordEngine.engineName)
+        }
+        if let word = s["wake_word"] as? String {
+            if let resolved = wake.resolve(word) {
+                if resolved != wakeWord { wakeWord = resolved; wakeChanged = true }
+                if resolved != word { sendSetting("wake_word", resolved) }
+            } else {
+                Log.shared.add("Wake word \(word) isn't available on iOS; keeping \(wakeWord)")
+                sendSetting("wake_word", wakeWord)
+            }
+        }
+        if let v = Self.number(s["wake_word_threshold"]) {
+            let threshold = Float(v / 10)
+            if threshold != wakeThreshold { wakeThreshold = threshold; wakeChanged = true }
+        }
+        if let v = s["wake_word_sound"] as? String { wakeWordSound = v }
+        if let v = s["alarm_sound"] as? String { alarmSound = v }
+        if let v = Self.number(s["notification_volume"]) {
+            audio.voiceVolume = Float(v / 10)
+            sounds.effectVolume = Float(v / 10)
+            media.announceVolume = Float(v / 10)
+        }
+        if let v = Self.number(s["music_volume"]) { media.musicVolume = Float(v / 10) }
+        if let v = Self.number(s["alarm_volume"]) { sounds.alarmVolume = Float(v / 10) }
+        if let v = Self.number(s["ducking_volume"]) { media.duckingVolume = Float(v / 10) }
+        if let v = Self.number(s["mic_gain"]) { audio.micGainDb = Float(v) }
+        if let v = Self.bool(s["mute"]) {
+            if v != muted { muted = v; wakeChanged = true }
+        }
+        if let v = Self.bool(s["continue_conversation"]) { continueConversation = v }
+        if let v = Self.bool(s["screen_on_wake_word"]) { screenOnWakeWord = v }
+        if let v = Self.number(s["screen_brightness"]) {
+            brightness = CGFloat(max(0, min(100, v)) / 100)
+            if screenOn { UIScreen.main.brightness = brightness }
+        }
+        if let v = Self.bool(s["screen_always_on"]) { screenAlwaysOn = v; resetIdleTimer() }
+        if let v = Self.number(s["screen_timeout"]), v > 0 { screenTimeout = v; resetIdleTimer() }
+        if let v = Self.bool(s["screen_on"]) { v ? screenWake() : screenSleep() }
+        if let v = Self.bool(s["screen_saver"]), v { screenSleep() }
+        if s["dark_mode"] != nil { darkMode = Self.bool(s["dark_mode"]) }
+        if let v = Self.number(s["zoom_level"]) {
+            // HA sends round(zoom * 100) + 60, or 0 for the default.
+            pageZoom = v > 0 ? CGFloat(max(0.3, min(3, (v - 60) / 100))) : 1
+        }
+
+        if wakeChanged { configureWakeWord() }
+    }
+
+    /// Satellite.handleAction
     private func handleAction(_ action: String, _ payload: Any?) {
         let body = payload as? [String: Any] ?? [:]
+        Log.shared.add("Action: \(action)")
         switch action {
         case "wake":
             talkNow()
         case "interrupt":
-            audio.cancelResponse()
+            stopWordDetected()
         case "refresh":
             webCommands.send(.reload)
         case "navigate":
-            let path = body["path"] as? String ?? payload as? String ?? ""
-            if let url = resolve(path) { webCommands.send(.load(url)) }
-            screenWake()
+            let target = body["url"] as? String ?? body["path"] as? String ?? payload as? String ?? ""
+            if let url = resolve(target) { webCommands.send(.load(url)) }
+        case "toast-message":
+            if let text = body["message"] as? String ?? payload as? String { showToast(text) }
+        case "alarm":
+            setAlarm(Self.bool(body["activate"]) ?? false)
         case "screen-wake":
             screenWake()
         case "screen-sleep":
             screenSleep()
-        case "toast-message":
-            let text = body["message"] as? String ?? body["text"] as? String ?? payload as? String
-            if let text { showToast(text) }
         case "play-media":
-            guard let urlText = body["url"] as? String, let url = resolve(urlText) else { return }
-            let volume = Self.number(body["volume"] as Any).map { Float($0 / 100) }
-            media.play(url: url, volume: volume, announce: Self.bool(body["announce"] as Any) ?? false)
+            guard let text = body["url"] as? String, let url = resolve(text) else { return }
+            let volume = Float(Self.number(body["volume"]) ?? 90) / 100
+            media.play(url: url, volume: volume, announce: Self.bool(body["announce"]) ?? false)
         case "play":
-            media.resume(volume: Self.number(body["volume"] as Any).map { Float($0 / 100) })
+            media.resume(volume: nil)
         case "pause":
             media.pause()
         case "stop":
             media.stop()
         case "set-volume":
-            if let v = Self.number(body["volume"] as Any) { media.musicVolume = Float(v / 100) }
+            if let v = Self.number(body["volume"]) { media.musicVolume = Float(v / 100) }
         case "get-logs":
-            var event = SatelliteMessages.custom(CustomEventType.logs, [:])
+            var event = SatelliteMessages.custom(CustomEventType.logs, [
+                "timestamp": SatelliteMessages.isoNow(),
+                "request_id": body["request_id"] as? String ?? "",
+                "lines": Log.shared.lines.count,
+                "level": "V",
+            ])
             event.payload = Data(Log.shared.text.utf8)
             satelliteConnection?.send(event)
         default:
-            Log.shared.add("Action not supported on iOS yet: \(action)")
+            Log.shared.add("Action not supported on iOS: \(action)")
         }
+    }
+
+    private func setAlarm(_ on: Bool) {
+        if on {
+            sounds.startAlarm(alarmSound)
+            screenWake()
+        } else {
+            sounds.stopAlarm()
+        }
+        updateStopWordArmed()
+        sendSetting("alarm", on)
+    }
+
+    private func sendSetting(_ name: String, _ value: Any) {
+        satelliteConnection?.send(SatelliteMessages.setting(name, value))
     }
 
     // MARK: Dashboard
 
-    /// Base URL of Home Assistant's web UI.
     private var haBaseURL: String? {
         if let url = haSettings["ha_url"] as? String, !url.isEmpty {
             return url.hasSuffix("/") ? String(url.dropLast()) : url
@@ -441,11 +526,10 @@ final class Satellite: ObservableObject {
         let override = settings.haURLOverride.trimmingCharacters(in: .whitespaces)
         if !override.isEmpty { return override.hasSuffix("/") ? String(override.dropLast()) : override }
         guard let host = haHost else { return nil }
-        let port = Self.number(haSettings["ha_port"] as Any).map { Int($0) } ?? 8123
+        let port = Self.number(haSettings["ha_port"]).map { Int($0) } ?? 8123
         return "http://\(host):\(port)"
     }
 
-    /// Absolute URLs pass through; paths are joined to Home Assistant's URL.
     private func resolve(_ pathOrURL: String) -> URL? {
         if pathOrURL.hasPrefix("http://") || pathOrURL.hasPrefix("https://") { return URL(string: pathOrURL) }
         guard let base = haBaseURL else { return nil }
@@ -460,7 +544,6 @@ final class Satellite: ObservableObject {
         if url != dashboardURL { dashboardURL = url }
     }
 
-    /// The web view reports where it is, for the current path sensor.
     func webPathChanged(_ path: String) {
         guard path != currentPath else { return }
         currentPath = path
@@ -470,7 +553,7 @@ final class Satellite: ObservableObject {
     // MARK: Screen
 
     /// iOS apps can't turn the screen off, so "off" is brightness zero with
-    /// a black cover; touching it or any activity turns it back on.
+    /// a black cover; a touch or the wake word turns it back on.
     func screenSleep() {
         guard screenOn else { return }
         screenOn = false
@@ -486,7 +569,6 @@ final class Satellite: ObservableObject {
         sendStatus()
     }
 
-    /// Any touch on the screen.
     func userActivity() {
         screenWake()
     }
@@ -535,7 +617,7 @@ final class Satellite: ObservableObject {
 
     // MARK: Helpers
 
-    static func number(_ value: Any) -> Double? {
+    static func number(_ value: Any?) -> Double? {
         switch value {
         case let v as Double: return v
         case let v as Int: return Double(v)
@@ -545,7 +627,7 @@ final class Satellite: ObservableObject {
         }
     }
 
-    static func bool(_ value: Any) -> Bool? {
+    static func bool(_ value: Any?) -> Bool? {
         switch value {
         case let v as Bool: return v
         case let v as Int: return v != 0
@@ -562,4 +644,90 @@ final class Satellite: ObservableObject {
             String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
         }
     }()
+}
+
+// MARK: - AudioPipelineHost
+
+extension Satellite: AudioPipelineHost {
+    func pipelineSend(_ event: WyomingEvent) {
+        satelliteConnection?.send(event)
+    }
+
+    func pipelineStageChanged(_ stage: PipelineStage) {
+        switch stage {
+        case .started, .listening, .voiceStarted:
+            setPhase(.listening)
+        case .voiceStopped, .awaitingResponse, .awaitingTTS:
+            setPhase(.thinking)
+        case .startingTTS, .streamingTTS, .completedTTS:
+            setPhase(.speaking)
+        case .ended:
+            setPhase(.idle)
+        default:
+            break
+        }
+        updateStopWordArmed()
+    }
+
+    func pipelineMicrophone(enabled: Bool) {
+        if enabled {
+            // Send what was said since the wake word first, then live audio.
+            for chunk in preRoll ?? [] { sendMic(chunk) }
+            preRoll = nil
+            micStreaming = true
+        } else {
+            micStreaming = false
+            preRoll = nil
+        }
+    }
+
+    func pipelineRequestTranscript(_ text: String) {
+        transcript = text
+    }
+
+    func pipelineResponseTranscript(_ text: String) {
+        response = text
+    }
+
+    func pipelineError(code: String, text: String) {
+        Log.shared.add("Pipeline error: \(code) \(text)")
+        if code != "duplicate_wake_up_detected" { showError(text.isEmpty ? "Error: \(code)" : text) }
+    }
+
+    func pipelineVoiceStart(rate: Int, width: Int, channels: Int) {
+        media.setDucked(true)
+        audio.beginResponse(rate: rate, channels: channels)
+        updateStopWordArmed()
+    }
+
+    func pipelineVoiceChunk(_ pcm: Data) {
+        audio.appendResponse(pcm)
+    }
+
+    func pipelineVoiceDrain(_ done: @escaping () -> Void) {
+        audio.drainResponse(done)
+    }
+
+    func pipelineVoiceStop() {
+        audio.stopResponse()
+    }
+
+    func pipelineFinished(_ reason: PipelineEndReason, continueConversation: Bool) {
+        Log.shared.add("Pipeline ended: \(reason)\(continueConversation ? ", continuing conversation" : "")")
+        pipelineWatchdog?.invalidate()
+        pipelineWatchdog = nil
+        micStreaming = false
+        preRoll = nil
+        pipeline = nil
+        updateStopWordArmed()
+
+        if reason == .endOfPipeline && continueConversation {
+            startPipeline(.continueConversation)
+            return
+        }
+        media.setDucked(false)
+        setPhase(.idle)
+        resetIdleTimer()
+        if reason == .errored && wakeWordSound != "none" { sounds.playError() }
+    }
 }

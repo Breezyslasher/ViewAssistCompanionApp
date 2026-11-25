@@ -5,6 +5,7 @@ on:
     branches: ['**']
     paths:
       - 'ios/**'
+      - 'app/src/main/assets/**'
       - '.github/workflows/ios.yml'
     tags: ['ios-v*']
   pull_request:
@@ -57,11 +58,14 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Install pods (TensorFlow Lite)
+        run: pod install --repo-update
+
       - name: Build for iOS devices (unsigned)
         run: |
           set -o pipefail
           xcodebuild \
-            -project VACA.xcodeproj \
+            -workspace VACA.xcworkspace \
             -scheme VACA \
             -configuration Release \
             -sdk iphoneos \

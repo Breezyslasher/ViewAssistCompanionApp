@@ -53,7 +53,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Audio")
                 } footer: {
-                    Text("Helps the wake word work while the iPad is playing sound. Can make playback quieter.")
+                    Text("Keeps the iPad's own voice, sounds and music from triggering the wake word. On by default; can make playback a little quieter.")
                 }
 
                 Section {

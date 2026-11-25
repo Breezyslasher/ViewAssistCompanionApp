@@ -40,7 +40,7 @@ final class AppSettings: ObservableObject {
         port = (1...65535).contains(storedPort) ? UInt16(storedPort) : Self.defaultPort
         haURLOverride = defaults.string(forKey: "haURLOverride") ?? ""
         dashboardOverride = defaults.string(forKey: "dashboardOverride") ?? ""
-        echoCancellation = defaults.object(forKey: "echoCancellation") as? Bool ?? false
+        echoCancellation = defaults.object(forKey: "echoCancellation") as? Bool ?? true
         setupComplete = defaults.bool(forKey: "setupComplete")
     }
 

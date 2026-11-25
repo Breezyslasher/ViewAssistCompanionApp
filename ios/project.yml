@@ -1,5 +1,5 @@
-# XcodeGen spec: `xcodegen generate` (run by CI) creates VACA.xcodeproj.
-# The generated project is not committed.
+# XcodeGen spec: `xcodegen generate` then `pod install` (run by CI) create
+# VACA.xcodeproj and VACA.xcworkspace. Neither is committed.
 name: VACA
 options:
   bundleIdPrefix: io.github.breezyslasher
@@ -22,6 +22,20 @@ targets:
     scheme: {}
     sources:
       - path: VACA
+      # Wake word models and sounds come straight from the Android app's
+      # assets, bundled as folders (microwakeword/wakeWords/hey_jarvis.json…).
+      - path: ../app/src/main/assets/microwakeword
+        type: folder
+        buildPhase: resources
+      - path: ../app/src/main/assets/wakeSounds
+        type: folder
+        buildPhase: resources
+      - path: ../app/src/main/assets/alarm
+        type: folder
+        buildPhase: resources
+      - path: ../app/src/main/assets/other
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: VACACore
     settings:
