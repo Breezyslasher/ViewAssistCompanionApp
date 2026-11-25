@@ -214,11 +214,13 @@ final class MicroWakeWordTests: XCTestCase {
         let word = MicroWakeWord(id: "hey_jarvis", wakeWord: "Hey Jarvis", runner: runner,
                                  probabilityCutoff: 0.8, slidingWindowSize: 3)
         let step = [Float](repeating: 0, count: 40)
-        var results: [(Bool, Float)?] = []
-        for _ in 0..<9 { results.append(word.process(features: step)) }
+        var results: [Bool] = []
+        for _ in 0..<9 {
+            if let result = word.process(features: step) { results.append(result.detected) }
+        }
         // Runs every 3 steps (120 values); detects once the window of 3 is full.
         XCTAssertEqual(runner.calls, 3)
-        XCTAssertEqual(results.compactMap { $0?.0 }, [false, false, true])
+        XCTAssertEqual(results, [false, false, true])
     }
 
     func testNoDetectionBelowCutoff() {

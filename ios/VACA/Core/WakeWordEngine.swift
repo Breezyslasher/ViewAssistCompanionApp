@@ -1,58 +1,88 @@
 import Foundation
-import TensorFlowLite
+import TensorFlowLiteC
 import VACACore
 
 /// Runs a microWakeWord model with TensorFlow Lite (MicroWakeWord.kt).
+///
+/// Uses the TFLite C API: the Swift wrapper has no int8 tensor type, and
+/// microWakeWord models take int8 input.
 final class TFLiteRunner: WakeWordModelRunner {
-    private let interpreter: Interpreter
+    enum LoadError: Error { case model, interpreter, tensors, input, output }
+
+    private let model: OpaquePointer
+    private let options: OpaquePointer
+    private let interpreter: OpaquePointer
     let inputCount: Int
-    private let inputType: Tensor.DataType
-    private let inputScale: Float
-    private let inputZeroPoint: Int
+    private let inputType: TfLiteType
+    private let inputQuant: TfLiteQuantizationParams
 
     init(modelPath: String) throws {
-        var options = Interpreter.Options()
-        options.threadCount = 1
-        interpreter = try Interpreter(modelPath: modelPath, options: options)
-        try interpreter.allocateTensors()
-        let input = try interpreter.input(at: 0)
-        inputCount = input.shape.dimensions.reduce(1, *)
-        inputType = input.dataType
-        inputScale = input.quantizationParameters?.scale ?? 1
-        inputZeroPoint = input.quantizationParameters?.zeroPoint ?? 0
+        guard let model = TfLiteModelCreateFromFile(modelPath) else { throw LoadError.model }
+        guard let options = TfLiteInterpreterOptionsCreate() else {
+            TfLiteModelDelete(model)
+            throw LoadError.interpreter
+        }
+        TfLiteInterpreterOptionsSetNumThreads(options, 1)
+        guard let interpreter = TfLiteInterpreterCreate(model, options) else {
+            TfLiteInterpreterOptionsDelete(options)
+            TfLiteModelDelete(model)
+            throw LoadError.interpreter
+        }
+        self.model = model
+        self.options = options
+        self.interpreter = interpreter
+
+        guard TfLiteInterpreterAllocateTensors(interpreter) == kTfLiteOk else { throw LoadError.tensors }
+        guard let input = TfLiteInterpreterGetInputTensor(interpreter, 0) else { throw LoadError.input }
+        var count = 1
+        for i in 0..<TfLiteTensorNumDims(input) { count *= Int(TfLiteTensorDim(input, i)) }
+        inputCount = count
+        inputType = TfLiteTensorType(input)
+        inputQuant = TfLiteTensorQuantizationParams(input)
+    }
+
+    deinit {
+        TfLiteInterpreterDelete(interpreter)
+        TfLiteInterpreterOptionsDelete(options)
+        TfLiteModelDelete(model)
     }
 
     func probability(for features: [Float]) -> Float? {
-        do {
-            let data: Data
-            switch inputType {
-            case .int8:
-                let values = features.map { Quantization.int8($0, scale: inputScale, zeroPoint: inputZeroPoint) }
-                data = values.withUnsafeBufferPointer { Data(buffer: $0) }
-            case .uInt8:
-                let values = features.map { Quantization.uint8($0, scale: inputScale, zeroPoint: inputZeroPoint) }
-                data = values.withUnsafeBufferPointer { Data(buffer: $0) }
-            default:
-                data = features.withUnsafeBufferPointer { Data(buffer: $0) }
-            }
-            try interpreter.copy(data, toInputAt: 0)
-            try interpreter.invoke()
+        let scale = inputQuant.scale == 0 ? 1 : inputQuant.scale
+        let zeroPoint = Int(inputQuant.zero_point)
 
-            let output = try interpreter.output(at: 0)
-            let scale = output.quantizationParameters?.scale ?? 1
-            let zeroPoint = output.quantizationParameters?.zeroPoint ?? 0
-            guard let first = output.data.first else { return nil }
-            switch output.dataType {
-            case .uInt8:
-                return Quantization.dequantize(Int(first), scale: scale, zeroPoint: zeroPoint)
-            case .int8:
-                return Quantization.dequantize(Int(Int8(bitPattern: first)), scale: scale, zeroPoint: zeroPoint)
-            default:
-                return output.data.withUnsafeBytes { $0.load(as: Float.self) }
-            }
-        } catch {
-            Log.shared.add("Wake word model error: \(error)")
+        guard let input = TfLiteInterpreterGetInputTensor(interpreter, 0) else { return nil }
+        let status: TfLiteStatus
+        if inputType == kTfLiteInt8 {
+            let values = features.map { Quantization.int8($0, scale: scale, zeroPoint: zeroPoint) }
+            status = values.withUnsafeBytes { TfLiteTensorCopyFromBuffer(input, $0.baseAddress, $0.count) }
+        } else if inputType == kTfLiteUInt8 {
+            let values = features.map { Quantization.uint8($0, scale: scale, zeroPoint: zeroPoint) }
+            status = values.withUnsafeBytes { TfLiteTensorCopyFromBuffer(input, $0.baseAddress, $0.count) }
+        } else {
+            status = features.withUnsafeBytes { TfLiteTensorCopyFromBuffer(input, $0.baseAddress, $0.count) }
+        }
+        guard status == kTfLiteOk, TfLiteInterpreterInvoke(interpreter) == kTfLiteOk,
+              let output = TfLiteInterpreterGetOutputTensor(interpreter, 0) else {
             return nil
+        }
+
+        let outQuant = TfLiteTensorQuantizationParams(output)
+        let outScale = outQuant.scale == 0 ? 1 : outQuant.scale
+        let outZero = Int(outQuant.zero_point)
+        let type = TfLiteTensorType(output)
+        var bytes = [UInt8](repeating: 0, count: max(4, TfLiteTensorByteSize(output)))
+        let copied = bytes.withUnsafeMutableBytes {
+            TfLiteTensorCopyToBuffer(output, $0.baseAddress, TfLiteTensorByteSize(output))
+        }
+        guard copied == kTfLiteOk else { return nil }
+
+        if type == kTfLiteUInt8 {
+            return Quantization.dequantize(Int(bytes[0]), scale: outScale, zeroPoint: outZero)
+        } else if type == kTfLiteInt8 {
+            return Quantization.dequantize(Int(Int8(bitPattern: bytes[0])), scale: outScale, zeroPoint: outZero)
+        } else {
+            return bytes.withUnsafeBytes { $0.load(as: Float.self) }
         }
     }
 }

@@ -4,7 +4,8 @@ project 'VACA.xcodeproj'
 
 target 'VACA' do
   use_frameworks! :linkage => :static
-  pod 'TensorFlowLiteSwift', '~> 2.14'
+  # The C API: the Swift wrapper can't handle int8 tensors.
+  pod 'TensorFlowLiteC', '~> 2.14'
 end
 
 post_install do |installer|

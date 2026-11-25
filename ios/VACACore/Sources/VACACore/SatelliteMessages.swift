@@ -37,6 +37,7 @@ public enum CustomEventType {
     public static let action = "action"
     public static let status = "status"
     public static let logs = "logs"
+    public static let capabilities = "capabilities"
 }
 
 /// Microphone audio format Home Assistant expects (const.py).
