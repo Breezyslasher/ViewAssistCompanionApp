@@ -1,0 +1,117 @@
+name: iOS app
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+    tags: ['ios-v*']
+  pull_request:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish the .ipa as a GitHub prerelease
+        type: boolean
+        default: false
+
+jobs:
+  # ───────────────────────────────────────────────
+  # Unit tests for the Wyoming protocol code (VACACore package).
+  # ───────────────────────────────────────────────
+  test:
+    name: Protocol tests
+    runs-on: macos-15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ios/VACACore
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        run: swift test
+
+  # ───────────────────────────────────────────────
+  # Unsigned .ipa for real iPhones and iPads (arm64). A sideloading tool
+  # (Sideloadly, AltStore, SideStore) signs it with your own Apple ID at
+  # install, so CI needs no certificate and no Mac is needed at home.
+  # ───────────────────────────────────────────────
+  build:
+    name: iOS (.ipa, unsigned)
+    runs-on: macos-15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iOS devices (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project VACA.xcodeproj \
+            -scheme VACA \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
+            build
+
+      - name: Pack .ipa
+        run: |
+          set -eu
+          app=build/Build/Products/Release-iphoneos/VACA.app
+          test -d "$app"
+          mkdir -p ipa/Payload
+          cp -R "$app" ipa/Payload/
+          (cd ipa && zip -qry ../VACA.ipa Payload)
+          ls -la VACA.ipa
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: VACA-ios-${{ github.run_number }}
+          path: ios/VACA.ipa
+          if-no-files-found: error
+
+  # ───────────────────────────────────────────────
+  # A draft release for `ios-v*` tags, or a prerelease when run by hand
+  # with `prerelease` ticked.
+  # ───────────────────────────────────────────────
+  release:
+    name: Release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: startsWith(github.ref, 'refs/tags/ios-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.prerelease == 'true')
+    steps:
+      - name: Download .ipa
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VACA for iOS ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build {0}', github.run_number) }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('ios-build-{0}', github.run_number) }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ startsWith(github.ref, 'refs/tags/') }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          generate_release_notes: true
+          files: dist/VACA-ios-*/*.ipa

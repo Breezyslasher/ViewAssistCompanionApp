@@ -84,3 +84,11 @@ scripts/common.ps1
 scripts/mute.ps1
 .claude/commands/mute.md
 .claude/commands/unmute.md
+
+# iOS app (ios/): generated Xcode project and build output
+ios/*.xcodeproj/
+ios/build/
+ios/ipa/
+ios/*.ipa
+ios/VACACore/.build/
+ios/VACACore/.swiftpm/

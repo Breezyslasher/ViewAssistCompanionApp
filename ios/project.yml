@@ -1,0 +1,56 @@
+# XcodeGen spec: `xcodegen generate` (run by CI) creates VACA.xcodeproj.
+# The generated project is not committed.
+name: VACA
+options:
+  bundleIdPrefix: io.github.breezyslasher
+  deploymentTarget:
+    iOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+packages:
+  # The Wyoming protocol code, with unit tests (`swift test` in VACACore).
+  VACACore:
+    path: VACACore
+targets:
+  VACA:
+    type: application
+    platform: iOS
+    # A shared scheme, so CI can build with `xcodebuild -scheme VACA`.
+    scheme: {}
+    sources:
+      - path: VACA
+    dependencies:
+      - package: VACACore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.breezyslasher.vaca
+        PRODUCT_NAME: VACA
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: VACA
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: VACA listens for your voice commands and sends them to your Home Assistant.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: VACA connects to Home Assistant on your local network.
+    info:
+      path: VACA/Info.plist
+      properties:
+        # Home Assistant discovers the app through this Bonjour service.
+        NSBonjourServices:
+          - _vaca._tcp
+        # Keeps the microphone (and the connection) running when the screen
+        # locks, so voice control still works.
+        UIBackgroundModes:
+          - audio
+        # Home Assistant is often plain HTTP on the home network.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoadsInWebContent: true
+          NSAllowsLocalNetworking: true
+        UIRequiresFullScreen: true
